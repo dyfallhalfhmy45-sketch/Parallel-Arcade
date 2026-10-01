@@ -3,6 +3,8 @@ import asyncio
 import contextlib
 import hmac
 import io
+import importlib.util
+import shutil
 import json
 import math
 import os
@@ -18,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
+from typing import Literal
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
@@ -25,10 +28,11 @@ DATA.mkdir(parents=True, exist_ok=True)
 TOKEN = os.getenv('PARALLEL_TOKEN', '')
 ORIGINS = [s.strip() for s in os.getenv('ALLOWED_ORIGINS', 'http://localhost:8000,http://127.0.0.1:8000').split(',') if s.strip()]
 MAX_ISO = int(os.getenv('MAX_ISO_BYTES', str(8 * 1024**3)))
-app = FastAPI(title='Parallel Arcade Gateway', version='0.1.0', docs_url=None, redoc_url=None)
+app = FastAPI(title='Parallel Arcade Gateway', version='0.2.0', docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=['GET','POST'], allow_headers=['Authorization','Content-Type'])
 Image.MAX_IMAGE_PIXELS = 16000000
 translation_lock = asyncio.Lock()
+ocr_slots = asyncio.Semaphore(2)
 cache = OrderedDict()
 rooms = {}
 peers = set()
@@ -51,7 +55,10 @@ def translator():
         langs = tr.get_installed_languages()
         english = next(x for x in langs if x.code == 'en')
         arabic = next(x for x in langs if x.code == 'ar')
-        return english.get_translation(arabic)
+        result = english.get_translation(arabic)
+        if result is None:
+            raise RuntimeError('No English to Arabic translation path')
+        return result
     except Exception as exc:
         raise RuntimeError('Arabic model unavailable. Run: python backend/install_model.py') from exc
 
@@ -60,7 +67,11 @@ async def translate(text):
     text = text.strip()[:3000]
     if not text:
         return ''
-    async with translation_lock:
+    try:
+        await asyncio.wait_for(translation_lock.acquire(), timeout=1)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(429, 'Translation worker busy; retry shortly') from exc
+    try:
         if text in cache:
             cache.move_to_end(text)
             return cache[text]
@@ -72,6 +83,18 @@ async def translate(text):
         if len(cache) > 256:
             cache.popitem(last=False)
         return result
+    finally:
+        translation_lock.release()
+
+
+def ocr_ready():
+    if not shutil.which('tesseract') or importlib.util.find_spec('pytesseract') is None:
+        return False
+    try:
+        import pytesseract
+        return 'eng' in pytesseract.get_languages(config='')
+    except Exception:
+        return False
 
 
 @app.get('/api/health', dependencies=[Depends(auth)])
@@ -81,7 +104,11 @@ async def health():
         ready = True
     except Exception:
         ready = False
-    return {'status':'ok', 'translation_ready':ready, 'iso_launch':False, 'video_stream':bool(os.getenv('DISPLAY_SOURCE')), 'version':'0.1.0'}
+    ocr = await asyncio.to_thread(ocr_ready)
+    stream = bool(os.getenv('DISPLAY_SOURCE')) and all(importlib.util.find_spec(m) is not None for m in ('aiortc','arabic_reshaper','bidi'))
+    return {'status':'ok', 'translation_ready':ready, 'ocr_ready':ocr,
+            'iso_launch':False, 'stream_configured':stream, 'stream_tested':False,
+            'commercial_game_adapters':[], 'version':'0.2.0'}
 
 
 class TextRequest(BaseModel):
@@ -94,40 +121,61 @@ async def translate_endpoint(payload: TextRequest):
 
 
 def read_text(image):
-    import pytesseract
-    return pytesseract.image_to_string(image, lang='eng', config='--psm 11', timeout=15).strip()[:3000]
+    try:
+        import pytesseract
+        return pytesseract.image_to_string(image, lang='eng', config='--psm 11', timeout=15).strip()[:3000]
+    except ImportError as exc:
+        raise RuntimeError('Install pytesseract') from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError('Install Tesseract') from exc
+
+
+def crop_for_ocr(image, region):
+    width, height = image.size
+    regions = {'full':(0,0,width,height), 'bottom':(0,int(height*.55),width,height),
+               'top':(0,0,width,max(1,int(height*.45))),
+               'center':(0,int(height*.25),width,max(1,int(height*.75)))}
+    return image.crop(regions[region])
 
 
 @app.post('/api/ocr', dependencies=[Depends(auth)])
-async def ocr_endpoint(request: Request):
-    # Bound the entire request before multipart parsing to prevent oversized images.
-    chunks, size = [], 0
-    async for chunk in request.stream():
-        size += len(chunk)
-        if size > 6 * 1024**2:
-            raise HTTPException(413, 'Screenshot limit is 5 MB')
-        chunks.append(chunk)
-    request._body = b''.join(chunks)
-    form = await request.form(max_files=1, max_fields=0)
-    file = form.get('file')
-    if not file or not hasattr(file, 'read'):
-        raise HTTPException(422, 'Image file required')
+async def ocr_endpoint(request: Request, region: Literal['full','bottom','top','center']='full'):
     try:
+        await asyncio.wait_for(ocr_slots.acquire(), timeout=.1)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(429, 'OCR workers busy; retry shortly') from exc
+    started = time.monotonic()
+    file = None
+    try:
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > 6 * 1024**2:
+                raise HTTPException(413, 'Screenshot limit is 5 MB')
+            chunks.append(chunk)
+        request._body = b''.join(chunks)
+        form = await request.form(max_files=1, max_fields=0)
+        file = form.get('file')
+        if not file or not hasattr(file, 'read'):
+            raise HTTPException(422, 'Image file required')
         raw = await file.read()
         if len(raw) > 5 * 1024**2:
             raise HTTPException(413, 'Screenshot limit is 5 MB')
-        image = Image.open(io.BytesIO(raw))
-        if image.width * image.height > 16000000:
-            raise HTTPException(413, 'Image pixel limit exceeded')
-        image = image.convert('RGB')
+        with Image.open(io.BytesIO(raw)) as source:
+            if source.width * source.height > 16000000 or min(source.size) < 2:
+                raise HTTPException(413, 'Image dimensions outside allowed range')
+            image = crop_for_ocr(source.convert('RGB'),region)
         english = await asyncio.to_thread(read_text, image)
-        return {'english':english, 'arabic':await translate(english)}
-    except (UnidentifiedImageError, Image.DecompressionBombError) as exc:
-        raise HTTPException(422, 'Invalid or oversized image') from exc
-    except RuntimeError as exc:
+        return {'english':english, 'arabic':await translate(english), 'region':region,
+                'elapsed_ms':round((time.monotonic()-started)*1000)}
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as exc:
+        raise HTTPException(422, 'Invalid, unreadable or oversized image') from exc
+    except (RuntimeError, ImportError) as exc:
         raise HTTPException(503, 'OCR unavailable or timed out; check Tesseract installation') from exc
     finally:
-        await file.close()
+        if file is not None and hasattr(file,'close'):
+            await file.close()
+        ocr_slots.release()
 
 
 @app.post('/api/games', dependencies=[Depends(auth)])
@@ -141,7 +189,17 @@ async def upload_game(request: Request):
             raise HTTPException(413, 'ISO exceeds configured server limit')
     except ValueError as exc:
         raise HTTPException(400, 'Invalid Content-Length') from exc
-    form = await request.form(max_files=1, max_fields=1)
+    original_receive = request.receive
+    received = 0
+    async def limited_receive():
+        nonlocal received
+        message = await original_receive()
+        received += len(message.get('body',b''))
+        if received > MAX_ISO + 1024 * 1024:
+            raise HTTPException(413, 'ISO exceeds configured server limit')
+        return message
+    bounded_request = Request(request.scope, receive=limited_receive)
+    form = await bounded_request.form(max_files=1, max_fields=1)
     file = form.get('file')
     if not file or not hasattr(file, 'read') or not (file.filename or '').lower().endswith('.iso'):
         raise HTTPException(422, 'An ISO file is required')
@@ -152,7 +210,7 @@ async def upload_game(request: Request):
         if not isinstance(raw, str) or len(raw) > 100000:
             raise ValueError('Invalid profile size')
         profile = json.loads(raw)
-        if profile.get('schema_version') != 1 or not all(isinstance(profile.get(k), str) and profile[k] for k in ('id','title','adapter','game_version')):
+        if not isinstance(profile,dict) or profile.get('schema_version') != 1 or not all(isinstance(profile.get(k), str) and profile[k] for k in ('id','title','adapter','game_version')):
             raise ValueError('Profile requires schema_version=1, id, title, adapter, game_version')
         size = 0
         with target.open('wb') as out:
@@ -201,7 +259,7 @@ async def room_socket(ws: WebSocket, room: str):
     client_id = uuid.uuid4().hex[:12]
     try:
         message = await asyncio.wait_for(ws.receive_json(), timeout=8)
-        if message.get('type') != 'auth' or not authorized(str(message.get('token',''))):
+        if not isinstance(message,dict) or message.get('type') != 'auth' or not authorized(str(message.get('token',''))):
             await ws.close(code=1008)
             return
         if len(rooms) >= 100 and room not in rooms or len(rooms.get(room,{})) >= 8:
@@ -212,6 +270,8 @@ async def room_socket(ws: WebSocket, room: str):
         last_position, last_event = 0.0, 0.0
         while True:
             message = await ws.receive_json()
+            if not isinstance(message,dict):
+                continue
             now = time.monotonic()
             if message.get('type') == 'position' and now-last_position >= .07:
                 values = [message.get(k,0) for k in ('x','y','z')]

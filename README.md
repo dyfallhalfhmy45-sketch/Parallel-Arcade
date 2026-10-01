@@ -30,9 +30,35 @@ This repository is an **MVP / integration foundation**, not a universal cloud em
 
 Nothing here promises that “any ISO + a few addresses” works. Addresses, entity ownership, AI state, controller routing, savestates and spawn functions depend on the exact game and emulator build. Runtime latency is hardware/network dependent; sub-second AI translation is not guaranteed.
 
+## v0.2 update
+
+The default screen now offers **PC, Xbox, PlayStation and other image sources** with separate, honest setup paths. This is a screen-translation workflow, not newly added commercial-game emulation. Xbox guidance opens [official Remote Play requirements](https://www.xbox.com/en-US/consoles/remote-play); PS2 guidance links to the [PCSX2 compatibility list](https://pcsx2.net/compat/). Capture permission, image readability and game/device compatibility are still required.
+
+Added:
+- Independent readiness checks for Arabic model, English OCR and video configuration.
+- No screen-sharing request before translation services pass readiness checks.
+- Four OCR regions: full, bottom dialogue area, top and center.
+- Real processing duration in OCR results.
+- Aborted capture requests cannot append stale subtitles after sharing stops.
+- Clear network, access-token, upload-size and busy-worker messages.
+- Bounded OCR concurrency and translation queue wait.
+- Streamed upload body limits, even with a dishonest Content-Length.
+- Rejection of JSON profiles that are arrays instead of objects.
+- `start.py`: guided local Docker startup with generated token and idempotent model installation.
+
+### Easier local setup
+
+Install Docker Desktop/Engine and Python, extract the source bundle, then run:
+
+```bash
+python start.py
+```
+
+The first run can take several minutes and downloads dependencies plus the translation model. It creates a local `.env` only when absent, prints your access token, and opens `http://localhost:8000`. Paste the token in **Server & sync** and click **Test connection**. Existing `.env` configuration is preserved. The launcher does not install games or emulators. Use `--skip-model` only if the model is already installed or you intentionally do not need translation.
+
 ## 1. Try the site immediately
 
-Open `dist/index.html` in a modern desktop browser, or serve the directory:
+Open `dist/index.html` in a modern desktop browser and choose Play room for the demo, or serve the directory:
 
 ```bash
 python -m http.server 8080 --directory dist
@@ -164,7 +190,8 @@ python package_release.py
 
 ```text
 dist/                 Static bilingual website and original canvas game
-backend/app.py        Auth, OCR, translation, uploads, rooms, WebRTC signaling
+start.py              Guided local Docker startup
+backend/app.py        Auth, readiness, OCR, translation, uploads, rooms, WebRTC signaling
 backend/stream.py     OCR + Arabic text burned into captured frames
 backend/adapter.py    Per-game adapter contract (implementation required)
 backend/sync_client.py Local adapter ↔ room relay

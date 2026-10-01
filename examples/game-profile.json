@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "your-game-build",
+  "title": "Your legally owned game",
+  "game_version": "exact-region-and-revision",
+  "adapter": "your-separately-implemented-adapter",
+  "iso_sha256": "replace-with-verified-sha256",
+  "capabilities": ["coordinates", "savestates"],
+  "memory": {},
+  "note": "This is a schema example, not a working emulator profile. Addresses depend on the exact game version."
+}

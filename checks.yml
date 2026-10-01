@@ -12,6 +12,7 @@ jobs:
         with:
           node-version: '22'
       - run: node --check dist/app.js
-      - run: python -m compileall -q backend
+      - run: node --check dist/hub.js
+      - run: python -m compileall -q backend start.py
       - run: pip install fastapi httpx python-multipart Pillow
       - run: python -m unittest discover -s tests -v
